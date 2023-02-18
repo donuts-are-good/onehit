@@ -38,6 +38,21 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", corsMiddleware(router)))
 }
 
+func corsMiddleware(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		handler.ServeHTTP(w, r)
+	})
+}
+
 func initDB() (*sqlx.DB, error) {
 	db, err := sqlx.Connect("sqlite3", "kv.db")
 	if err != nil {
@@ -91,6 +106,7 @@ func handleRegisterHit(db *sqlx.DB) http.HandlerFunc {
 		fmt.Fprintf(w, "Registered hit for key %s", key)
 	}
 }
+
 func handleGetHitCount(db *sqlx.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -136,8 +152,12 @@ func handleGetHitCount(db *sqlx.DB) http.HandlerFunc {
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
+		startIndex := startDay - 1
+		if len(values) < startIndex {
+			startIndex = len(values)
+		}
 		sum := 0
-		for i := startDay - 1; i < len(values); i++ {
+		for i := startIndex; i < len(values); i++ {
 			sum += int(values[i])
 		}
 		fmt.Fprintf(w, "%d", sum)
