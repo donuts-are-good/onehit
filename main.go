@@ -62,9 +62,10 @@ func initDB() (*sqlx.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.MustExec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, values BLOB)")
+	db.MustExec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, hit_counts BLOB)")
 	return db, nil
 }
+
 
 func handleRegisterHit(db *sqlx.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
