@@ -1,166 +1,95 @@
 package main
 
 import (
-	"bytes"
-	"database/sql"
-	"encoding/gob"
-	"fmt"
-	"log"
-	"net/http"
-	"strconv"
-	"time"
+    "database/sql"
+    "fmt"
+    "log"
+    "net/http"
+    "strconv"
+    "strings"
 
-	"github.com/jmoiron/sqlx"
-	_ "github.com/mattn/go-sqlite3"
+    "github.com/jmoiron/sqlx"
+		_ "github.com/mattn/go-sqlite3"
+
 )
 
 type KeyValue struct {
-	Key    string `db:"key"`
-	Values []byte `db:"values"`
+    Key   string `db:"key"`
+    Value int    `db:"value"`
 }
-
-const (
-	defaultWindowSize = 30
-	maxWindowSize     = 365
-)
 
 func main() {
-	db, err := initDB()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer db.Close()
+    // Open SQLite database
+    db, err := sqlx.Connect("sqlite3", "kv.db")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
 
-	router := http.NewServeMux()
-	router.HandleFunc("/x/", handleRegisterHit(db))
-	router.HandleFunc("/r/", handleGetHitCount(db))
+    // Create table if it doesn't exist
+    db.MustExec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value INTEGER)")
 
-	log.Fatal(http.ListenAndServe(":8080", corsMiddleware(router)))
+    // Create HTTP server with CORS middleware
+    handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Access-Control-Allow-Origin", "*")
+
+        switch r.Method {
+        case http.MethodGet:
+            // Check if path starts with "/x/"
+            if len(r.URL.Path) > 3 && r.URL.Path[:3] == "/x/" {
+                key := r.URL.Path[3:]
+                // Insert or update row with key
+                db.MustExec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, COALESCE((SELECT value FROM kv WHERE key = ?), 0) + 1)", key, key)
+                fmt.Fprintf(w, "Registered hit for key %s", key)
+            } else if len(r.URL.Path) > 3 && r.URL.Path[:3] == "/r/" {
+                key := r.URL.Path[3:]
+                // Get row with key
+                var kv KeyValue
+                err := db.Get(&kv, "SELECT * FROM kv WHERE key = ?", key)
+                if err == sql.ErrNoRows {
+                    fmt.Fprintf(w, "Key %s not found", key)
+                } else if err != nil {
+                    log.Println(err)
+                    http.Error(w, "Internal server error", http.StatusInternalServerError)
+                } else {
+                    // Format value as human-readable string
+                    valueStr := formatValue(kv.Value)
+                    fmt.Fprint(w, valueStr)
+                }
+            } else {
+                http.NotFound(w, r)
+            }
+        default:
+            http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        }
+    })
+
+    // Start HTTP server
+    log.Fatal(http.ListenAndServe(":8080", handler))
 }
 
-func corsMiddleware(handler http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+func formatValue(value int) string {
+    var suffix string
+    var formattedValue string
 
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
+    if value >= 1000000000 {
+        suffix = "B"
+        formattedValue = fmt.Sprintf("%.2f", float64(value)/1000000000)
+    } else if value >= 1000000 {
+        suffix = "M"
+        formattedValue = fmt.Sprintf("%.2f", float64(value)/1000000)
+    } else if value >= 1000 {
+        suffix = "k"
+        formattedValue = fmt.Sprintf("%.1f", float64(value)/1000)
+    } else {
+        return strconv.Itoa(value)
+    }
 
-		handler.ServeHTTP(w, r)
-	})
-}
+    // Remove trailing ".00" from formatted value
+    formattedValue = strings.TrimRight(formattedValue, "0")
 
-func initDB() (*sqlx.DB, error) {
-	db, err := sqlx.Connect("sqlite3", "kv.db")
-	if err != nil {
-		return nil, err
-	}
-	err = db.Ping()
-	if err != nil {
-		return nil, err
-	}
-	db.MustExec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, hit_counts BLOB)")
-	return db, nil
-}
+    // Remove trailing "." if present
+    formattedValue = strings.TrimSuffix(formattedValue, ".")
 
-
-func handleRegisterHit(db *sqlx.DB) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		if len(r.URL.Path) <= 3 || r.URL.Path[:3] != "/x/" {
-			http.NotFound(w, r)
-			return
-		}
-
-		key := r.URL.Path[3:]
-		now := time.Now()
-		day := now.Day()
-		value := []byte{0}
-		var kv KeyValue
-		err := db.Get(&kv, "SELECT * FROM kv WHERE key = ?", key)
-		if err == sql.ErrNoRows {
-			buf := new(bytes.Buffer)
-			enc := gob.NewEncoder(buf)
-			enc.Encode(value)
-			db.MustExec("INSERT INTO kv (key, values) VALUES (?, ?)", key, buf.Bytes())
-		} else if err != nil {
-			log.Println(err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		} else {
-			buf := bytes.NewBuffer(kv.Values)
-			dec := gob.NewDecoder(buf)
-			dec.Decode(&value)
-			value[day-1]++
-			buf.Reset()
-			enc := gob.NewEncoder(buf)
-			enc.Encode(value)
-			db.MustExec("UPDATE kv SET values = substr(values, 2) || ? WHERE key = ?", buf.Bytes(), key)
-		}
-		fmt.Fprintf(w, "Registered hit for key %s", key)
-	}
-}
-
-func handleGetHitCount(db *sqlx.DB) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		if len(r.URL.Path) <= 3 || r.URL.Path[:3] != "/r/" {
-			http.NotFound(w, r)
-			return
-		}
-
-		key := r.URL.Path[3:]
-		var windowSize int
-		if len(r.URL.Path) > 4 {
-			size, err := strconv.Atoi(r.URL.Path[4:])
-			if err == nil && size > 0 && size <= maxWindowSize {
-				windowSize = size
-			} else {
-				windowSize = defaultWindowSize
-			}
-		} else {
-			windowSize = defaultWindowSize
-		}
-		now := time.Now()
-		startDay := now.AddDate(0, 0, -windowSize+1).Day()
-		var kv KeyValue
-		err := db.Get(&kv, "SELECT * FROM kv WHERE key = ?", key)
-		if err == sql.ErrNoRows {
-			fmt.Fprintf(w, "Key %s not found", key)
-			return
-		} else if err != nil {
-			log.Println(err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-		buf := bytes.NewBuffer(kv.Values)
-		dec := gob.NewDecoder(buf)
-		var values []byte
-		err = dec.Decode(&values)
-		if err != nil {
-			log.Println(err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-		startIndex := startDay - 1
-		if len(values) < startIndex {
-			startIndex = len(values)
-		}
-		sum := 0
-		for i := startIndex; i < len(values); i++ {
-			sum += int(values[i])
-		}
-		fmt.Fprintf(w, "%d", sum)
-	}
+    return formattedValue + suffix
 }
